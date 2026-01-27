@@ -194,3 +194,44 @@ Task management.
 2. **Error Handling:** Uses `ResponseErrors` schema
 3. **Input Types:** Separate Create/Update input schemas (e.g., `GoalCreateInput`, `GoalUpdateInput`)
 4. **Nested Resources:** Check-ins are nested under their parent (goals, metrics)
+5. **ETag Required for Updates:** PATCH requests require `If-Match` header with ETag from GET response
+
+## ETag Requirement for PATCH
+
+**All PATCH requests require the ETag header.** Without it, you get 412 Precondition Failed.
+
+**Workflow:**
+1. GET the resource to get its current ETag (in response headers)
+2. Send PATCH with `If-Match: <etag>` header
+
+**Example:**
+```bash
+# 1. Get current ETag
+ETAG=$(curl -sI "https://2.strety.com/api/v1/todos/{id}" \
+  -H "Authorization: Bearer $TOKEN" | grep -i etag | awk '{print $2}' | tr -d '\r')
+
+# 2. Update with ETag
+curl -X PATCH "https://2.strety.com/api/v1/todos/{id}" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -H "If-Match: $ETAG" \
+  -d '{"data":{"type":"todos","id":"{id}","attributes":{"completed_at":"2026-01-27T00:00:00.000Z"}}}'
+```
+
+## Completing a Todo
+
+To mark a todo complete, set `completed_at` to a timestamp:
+
+```json
+{
+  "data": {
+    "type": "todos",
+    "id": "todo-uuid",
+    "attributes": {
+      "completed_at": "2026-01-27T18:00:00.000Z"
+    }
+  }
+}
+```
+
+To un-complete, set `completed_at` to `null`.

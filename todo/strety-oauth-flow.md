@@ -10,7 +10,7 @@
 | Client ID | `FpZSRlALHMghs8wq485b_qjh_SjXn6yQwLa3kM8fz7E` |
 | Client Secret | `8jDvgnFtOvp1H-xkwIDf46YHVR62yZPCqTdRO_WWft8` |
 | Redirect URI (in Strety app) | `https://localhost:8888/callback` |
-| Authorization URL | `https://2.strety.com/oauth/authorize` |
+| Authorization URL | `https://2.strety.com/api/v1/oauth/authorize` |
 | Token URL | `https://2.strety.com/api/v1/oauth/token` |
 | Token File | `~/.mcp-strety/token.json` |
 
@@ -38,13 +38,13 @@ nc -l 8888
 
 **COPY THIS EXACT URL:**
 ```
-https://2.strety.com/oauth/authorize?client_id=FpZSRlALHMghs8wq485b_qjh_SjXn6yQwLa3kM8fz7E&redirect_uri=https://localhost:8888/callback&response_type=code&scope=read+write
+https://2.strety.com/api/v1/oauth/authorize?client_id=FpZSRlALHMghs8wq485b_qjh_SjXn6yQwLa3kM8fz7E&redirect_uri=https://localhost:8888/callback&response_type=code&scope=read+write
 ```
 
 **IMPORTANT:**
 - URL uses `https://localhost` (NOT http)
 - Must match the Redirect URI in Strety app settings exactly
-- Authorization endpoint is `/oauth/authorize` (NOT `/api/v1/oauth/authorize`)
+- Authorization endpoint is `/api/v1/oauth/authorize`
 
 ### Step 3: Authorize in browser
 
