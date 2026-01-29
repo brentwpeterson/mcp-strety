@@ -102,13 +102,16 @@ async function stretyRequest(
   endpoint: string,
   method: string = "GET",
   body?: unknown,
-  retryOnAuth: boolean = true
+  retryOnAuth: boolean = true,
+  extraHeaders?: Record<string, string>
 ): Promise<unknown> {
   const url = `${STRETY_API_BASE}${endpoint}`;
 
+  const isWrite = method === "POST" || method === "PATCH" || method === "PUT";
   const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
-    "Content-Type": "application/json",
+    "Content-Type": isWrite ? "application/vnd.api+json" : "application/json",
+    ...extraHeaders,
   };
 
   const options: RequestInit = {
@@ -116,7 +119,7 @@ async function stretyRequest(
     headers,
   };
 
-  if (body && (method === "POST" || method === "PATCH" || method === "PUT")) {
+  if (body && isWrite) {
     options.body = JSON.stringify(body);
   }
 
@@ -128,7 +131,7 @@ async function stretyRequest(
     const refreshed = await refreshAccessToken();
     if (refreshed) {
       // Retry the request with new token
-      return stretyRequest(endpoint, method, body, false);
+      return stretyRequest(endpoint, method, body, false, extraHeaders);
     }
     throw new Error("Authentication failed. Please re-authenticate with Strety.");
   }
@@ -144,6 +147,38 @@ async function stretyRequest(
   }
 
   return JSON.parse(text);
+}
+
+// Get the ETag for a resource (required for PATCH operations)
+async function getETag(endpoint: string): Promise<string> {
+  const url = `${STRETY_API_BASE}${endpoint}`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (response.status === 401) {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) {
+      return getETag(endpoint);
+    }
+    throw new Error("Authentication failed. Please re-authenticate with Strety.");
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to get ETag (${response.status}): ${errorText}`);
+  }
+
+  const etag = response.headers.get("etag");
+  if (!etag) {
+    throw new Error("No ETag returned by API. Cannot perform update.");
+  }
+
+  return etag;
 }
 
 // Types for Strety API responses
@@ -343,6 +378,159 @@ async function listPeople(): Promise<unknown> {
   };
 }
 
+// Helper to resolve assignee name to ID
+async function resolveAssigneeId(assigneeName: string): Promise<{ id: string } | { error: string; people: string[] }> {
+  const people = await getPeopleMap();
+  const assigneeLower = assigneeName.toLowerCase();
+  for (const [id, person] of people) {
+    if (person.attributes.name.toLowerCase().includes(assigneeLower)) {
+      return { id };
+    }
+  }
+  return {
+    error: `No person found matching "${assigneeName}"`,
+    people: Array.from(people.values()).map(p => p.attributes.name),
+  };
+}
+
+// Helper to format a todo response
+async function formatTodo(todo: StretyTodo) {
+  const people = await getPeopleMap();
+  const assignee = todo.relationships.assignee.data?.id
+    ? people.get(todo.relationships.assignee.data.id)?.attributes.name
+    : null;
+
+  return {
+    id: todo.id,
+    title: todo.attributes.title,
+    description: todo.attributes.description,
+    due_date: todo.attributes.due_date,
+    priority: todo.attributes.priority,
+    completed: todo.attributes.completed_at !== null,
+    completed_at: todo.attributes.completed_at,
+    assignee,
+    created_at: todo.attributes.created_at,
+    updated_at: todo.attributes.updated_at,
+  };
+}
+
+async function createTodo(args: {
+  title: string;
+  description?: string;
+  due_date?: string;
+  priority?: string;
+  assignee?: string;
+}): Promise<unknown> {
+  const body: Record<string, unknown> = {
+    data: {
+      type: "todos",
+      attributes: {
+        title: args.title,
+        ...(args.description && { description: args.description }),
+        ...(args.due_date && { due_date: args.due_date }),
+        ...(args.priority && { priority: args.priority }),
+      },
+      relationships: {} as Record<string, unknown>,
+    },
+  };
+
+  // Resolve assignee name to ID
+  if (args.assignee) {
+    const result = await resolveAssigneeId(args.assignee);
+    if ("error" in result) return result;
+    (body.data as Record<string, unknown>).relationships = {
+      assignee: { data: { id: result.id, type: "people" } },
+    };
+  }
+
+  const response = await stretyRequest("/todos", "POST", body) as { data: StretyTodo };
+  return {
+    success: true,
+    todo: await formatTodo(response.data),
+  };
+}
+
+async function updateTodo(args: {
+  todoId: string;
+  title?: string;
+  description?: string;
+  due_date?: string;
+  priority?: string;
+  assignee?: string;
+}): Promise<unknown> {
+  // Get ETag first (required for PATCH)
+  const etag = await getETag(`/todos/${args.todoId}`);
+
+  const attributes: Record<string, unknown> = {};
+  if (args.title !== undefined) attributes.title = args.title;
+  if (args.description !== undefined) attributes.description = args.description;
+  if (args.due_date !== undefined) attributes.due_date = args.due_date;
+  if (args.priority !== undefined) attributes.priority = args.priority;
+
+  const body: Record<string, unknown> = {
+    data: {
+      type: "todos",
+      id: args.todoId,
+      attributes,
+      relationships: {} as Record<string, unknown>,
+    },
+  };
+
+  if (args.assignee) {
+    const result = await resolveAssigneeId(args.assignee);
+    if ("error" in result) return result;
+    (body.data as Record<string, unknown>).relationships = {
+      assignee: { data: { id: result.id, type: "people" } },
+    };
+  }
+
+  const response = await stretyRequest(
+    `/todos/${args.todoId}`, "PATCH", body, true,
+    { "If-Match": etag }
+  ) as { data: StretyTodo };
+
+  return {
+    success: true,
+    todo: await formatTodo(response.data),
+  };
+}
+
+async function completeTodo(args: {
+  todoId: string;
+  uncomplete?: boolean;
+}): Promise<unknown> {
+  const etag = await getETag(`/todos/${args.todoId}`);
+
+  const body = {
+    data: {
+      type: "todos",
+      id: args.todoId,
+      attributes: {
+        completed_at: args.uncomplete ? null : new Date().toISOString(),
+      },
+    },
+  };
+
+  const response = await stretyRequest(
+    `/todos/${args.todoId}`, "PATCH", body, true,
+    { "If-Match": etag }
+  ) as { data: StretyTodo };
+
+  return {
+    success: true,
+    action: args.uncomplete ? "uncompleted" : "completed",
+    todo: await formatTodo(response.data),
+  };
+}
+
+async function deleteTodo(todoId: string): Promise<unknown> {
+  await stretyRequest(`/todos/${todoId}`, "DELETE");
+  return {
+    success: true,
+    deleted: todoId,
+  };
+}
+
 // MCP Server setup
 const server = new Server(
   {
@@ -403,6 +591,103 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: "strety_create_todo",
+      description: "Create a new todo in Strety. Returns the created todo with its ID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "Title of the todo (required)",
+          },
+          description: {
+            type: "string",
+            description: "Description text for the todo",
+          },
+          due_date: {
+            type: "string",
+            description: "Due date in ISO 8601 format (e.g., '2026-02-15')",
+          },
+          priority: {
+            type: "string",
+            description: "Priority level",
+          },
+          assignee: {
+            type: "string",
+            description: "Assignee name (partial match, e.g., 'Brent' or 'isaac')",
+          },
+        },
+        required: ["title"],
+      },
+    },
+    {
+      name: "strety_update_todo",
+      description: "Update an existing todo in Strety. Only provide fields you want to change. Handles ETag automatically.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          todoId: {
+            type: "string",
+            description: "The ID of the todo to update",
+          },
+          title: {
+            type: "string",
+            description: "New title",
+          },
+          description: {
+            type: "string",
+            description: "New description",
+          },
+          due_date: {
+            type: "string",
+            description: "New due date in ISO 8601 format (e.g., '2026-02-15')",
+          },
+          priority: {
+            type: "string",
+            description: "New priority level",
+          },
+          assignee: {
+            type: "string",
+            description: "New assignee name (partial match)",
+          },
+        },
+        required: ["todoId"],
+      },
+    },
+    {
+      name: "strety_complete_todo",
+      description: "Mark a todo as complete (or uncomplete it). Handles ETag automatically.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          todoId: {
+            type: "string",
+            description: "The ID of the todo to complete",
+          },
+          uncomplete: {
+            type: "boolean",
+            description: "Set to true to mark the todo as NOT complete (reopen it)",
+            default: false,
+          },
+        },
+        required: ["todoId"],
+      },
+    },
+    {
+      name: "strety_delete_todo",
+      description: "Permanently delete a todo from Strety. This cannot be undone.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          todoId: {
+            type: "string",
+            description: "The ID of the todo to delete",
+          },
+        },
+        required: ["todoId"],
+      },
+    },
   ],
 }));
 
@@ -427,6 +712,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "strety_list_people": {
         const result = await listPeople();
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_create_todo": {
+        const result = await createTodo({
+          title: args?.title as string,
+          description: args?.description as string | undefined,
+          due_date: args?.due_date as string | undefined,
+          priority: args?.priority as string | undefined,
+          assignee: args?.assignee as string | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_update_todo": {
+        const result = await updateTodo({
+          todoId: args?.todoId as string,
+          title: args?.title as string | undefined,
+          description: args?.description as string | undefined,
+          due_date: args?.due_date as string | undefined,
+          priority: args?.priority as string | undefined,
+          assignee: args?.assignee as string | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_complete_todo": {
+        const result = await completeTodo({
+          todoId: args?.todoId as string,
+          uncomplete: args?.uncomplete as boolean | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_delete_todo": {
+        const result = await deleteTodo(args?.todoId as string);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
 
