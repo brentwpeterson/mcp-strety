@@ -4,10 +4,11 @@ MCP (Model Context Protocol) server for integrating Strety with Claude Code.
 
 ## Features
 
-- List todos (with filtering by assignee, completion status)
-- Get todo details
-- List people in organization
+- **Read tools:** List todos (filtered by assignee, completion status), get todo details, list people
+- **Write tools:** Create, update, complete/uncomplete, and delete todos
 - Auto-refresh OAuth tokens
+- Automatic ETag handling for PATCH operations
+- Assignee name resolution (partial match, e.g., "Brent" resolves to full ID)
 
 ## Installation
 
@@ -90,11 +91,24 @@ The MCP server loads on Claude Code startup.
 
 ## Available Tools
 
+### Read Tools
+
 | Tool | Description |
 |------|-------------|
 | `strety_list_todos` | List todos with optional filters (assignee, completed status) |
 | `strety_get_todo` | Get full details of a specific todo |
 | `strety_list_people` | List all people in the organization |
+
+### Write Tools
+
+| Tool | Description |
+|------|-------------|
+| `strety_create_todo` | Create a new todo with title, description, assignee, due date, priority |
+| `strety_update_todo` | Update fields on an existing todo (auto ETag handling) |
+| `strety_complete_todo` | Mark a todo complete or uncomplete (auto ETag handling) |
+| `strety_delete_todo` | Permanently delete a todo |
+
+**Note:** Write tools require OAuth tokens with `read` and `write` scopes. PATCH operations (update, complete) automatically fetch the required ETag before sending the request.
 
 ## Token Management
 
@@ -121,9 +135,9 @@ The server handles token refresh automatically:
 2. Try refreshing manually (see oauth-flow.md)
 3. If refresh fails, re-authorize completely
 
-### "Invalid scope" when updating todos
+### "Invalid scope" or 403 when using write tools
 
-The token only has `read` scope. Re-authorize with `read+write` scope.
+The token only has `read` scope. Re-authorize with `read+write` scope (see OAuth flow docs).
 
 ### Todos not showing up
 
@@ -133,16 +147,17 @@ The server paginates through up to 50 pages. If Brent's todos are spread across 
 
 ```
 strety/
-├── src/index.ts      # Main server code
-├── dist/index.js     # Compiled output
+├── src/index.ts      # Main server code (7 tools)
+├── dist/index.js     # Compiled output (gitignored)
 ├── package.json
 ├── tsconfig.json
 ├── .gitignore
 ├── README.md         # This file
-└── todo/
+└── docs/
+    ├── README.md               # Docs index
     ├── strety-oauth-flow.md    # OAuth documentation
     ├── strety-api-mapping.md   # API endpoint reference
-    └── strety-mcp-tools-spec.md
+    └── strety-mcp-tools-spec.md # Tool specifications
 ```
 
 ## Development
