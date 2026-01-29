@@ -212,6 +212,30 @@ interface StretyTodo {
   };
 }
 
+interface StretyGoal {
+  id: string;
+  type: string;
+  attributes: {
+    id: string;
+    title: string;
+    due_date: string | null;
+    status: string | null;
+    completed_at: string | null;
+    created_at: string;
+    updated_at: string;
+    description: string | null;
+    description_html: string | null;
+  };
+  relationships: {
+    assignee: {
+      data: {
+        id: string;
+        type: string;
+      } | null;
+    };
+  };
+}
+
 interface StretyPerson {
   id: string;
   type: string;
@@ -375,6 +399,89 @@ async function listPeople(): Promise<unknown> {
       email: p.attributes.email,
     })),
     count: response.data.length,
+  };
+}
+
+async function listGoals(args: {
+  assignee?: string;
+  showCompleted?: boolean;
+  maxResults?: number;
+}): Promise<unknown> {
+  const maxResults = Math.min(args.maxResults || 50, 100);
+  const allGoals: StretyGoal[] = [];
+  const people = await getPeopleMap();
+
+  // Find assignee ID if name provided
+  let assigneeId: string | undefined;
+  if (args.assignee) {
+    const assigneeLower = args.assignee.toLowerCase();
+    for (const [id, person] of people) {
+      if (person.attributes.name.toLowerCase().includes(assigneeLower)) {
+        assigneeId = id;
+        break;
+      }
+    }
+    if (!assigneeId) {
+      return { error: `No person found matching "${args.assignee}"`, people: Array.from(people.values()).map(p => p.attributes.name) };
+    }
+  }
+
+  let endpoint = "/goals?page%5Bsize%5D=20";
+  if (assigneeId) {
+    endpoint += `&filter%5Bassignee_id%5D=${assigneeId}`;
+  }
+
+  let page = 1;
+  const maxPages = 50;
+
+  while (allGoals.length < maxResults && page <= maxPages) {
+    const response = await stretyRequest(`${endpoint}&page%5Bnumber%5D=${page}`) as StretyListResponse<StretyGoal>;
+
+    if (response.data.length === 0) break;
+
+    for (const goal of response.data) {
+      if (!args.showCompleted && goal.attributes.completed_at !== null) {
+        continue;
+      }
+      allGoals.push(goal);
+      if (allGoals.length >= maxResults) break;
+    }
+
+    if (!response.links.next) break;
+    page++;
+  }
+
+  const formattedGoals = allGoals.map(goal => {
+    const assignee = goal.relationships.assignee?.data?.id
+      ? people.get(goal.relationships.assignee.data.id)?.attributes.name
+      : null;
+
+    return {
+      id: goal.id,
+      title: goal.attributes.title,
+      description: goal.attributes.description,
+      due_date: goal.attributes.due_date,
+      status: goal.attributes.status,
+      completed: goal.attributes.completed_at !== null,
+      completed_at: goal.attributes.completed_at,
+      assignee,
+      created_at: goal.attributes.created_at,
+      updated_at: goal.attributes.updated_at,
+    };
+  });
+
+  formattedGoals.sort((a, b) => {
+    if (!a.due_date && !b.due_date) return 0;
+    if (!a.due_date) return 1;
+    if (!b.due_date) return -1;
+    return a.due_date.localeCompare(b.due_date);
+  });
+
+  return {
+    goals: formattedGoals,
+    count: formattedGoals.length,
+    assignee_filter: args.assignee || null,
+    show_completed: args.showCompleted || false,
   };
 }
 
@@ -592,6 +699,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "strety_list_goals",
+      description: "List goals (rocks) from Strety. Can filter by assignee name and completion status. Returns goals sorted by due date.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          assignee: {
+            type: "string",
+            description: "Filter by assignee name (partial match, e.g., 'Brent' or 'isaac')",
+          },
+          showCompleted: {
+            type: "boolean",
+            description: "Include completed goals (default: false, only shows open goals)",
+            default: false,
+          },
+          maxResults: {
+            type: "number",
+            description: "Maximum number of goals to return (default: 50, max: 100)",
+            default: 50,
+          },
+        },
+      },
+    },
+    {
       name: "strety_create_todo",
       description: "Create a new todo in Strety. Returns the created todo with its ID.",
       inputSchema: {
@@ -712,6 +842,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "strety_list_people": {
         const result = await listPeople();
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_list_goals": {
+        const result = await listGoals({
+          assignee: args?.assignee as string | undefined,
+          showCompleted: args?.showCompleted as boolean | undefined,
+          maxResults: args?.maxResults as number | undefined,
+        });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
 
