@@ -246,6 +246,46 @@ interface StretyPerson {
   };
 }
 
+interface StretyMetric {
+  id: string;
+  type: string;
+  attributes: {
+    id: string;
+    title: string;
+    description?: string | null;
+    target?: number | null;
+    target_operator?: string | null;
+    unit?: string | null;
+    frequency?: string | null;
+    current_value?: number | null;
+    created_at: string;
+    updated_at: string;
+    [key: string]: unknown;
+  };
+  relationships?: {
+    assignee?: { data: { id: string; type: string } | null };
+    space?: { data: { id: string; type: string } | null };
+    [key: string]: unknown;
+  };
+}
+
+interface StretyMetricCheckIn {
+  id: string;
+  type: string;
+  attributes: {
+    id: string;
+    value?: number | null;
+    note?: string | null;
+    date?: string | null;
+    created_at: string;
+    updated_at: string;
+    [key: string]: unknown;
+  };
+  relationships?: {
+    [key: string]: unknown;
+  };
+}
+
 interface StretyListResponse<T> {
   data: T[];
   meta: {
@@ -521,34 +561,79 @@ async function formatTodo(todo: StretyTodo) {
   };
 }
 
+// Cache for teams lookup
+let teamsCache: { id: string; name: string; leadership: boolean }[] | null = null;
+
+async function getTeams(): Promise<{ id: string; name: string; leadership: boolean }[]> {
+  if (teamsCache) return teamsCache;
+
+  const response = await stretyRequest("/teams") as StretyListResponse<{
+    id: string;
+    type: string;
+    attributes: { id: string; name: string; leadership: boolean };
+  }>;
+  teamsCache = response.data.map(t => ({
+    id: t.id,
+    name: t.attributes.name,
+    leadership: t.attributes.leadership,
+  }));
+  return teamsCache;
+}
+
+// Resolve team name to ID (partial match, defaults to Leadership team)
+async function resolveTeamId(teamName?: string): Promise<{ id: string; type: string }> {
+  const teams = await getTeams();
+
+  if (teamName) {
+    const nameLower = teamName.toLowerCase();
+    const match = teams.find(t => t.name.toLowerCase().includes(nameLower));
+    if (match) return { id: match.id, type: "team" };
+  }
+
+  // Default to leadership team
+  const leadership = teams.find(t => t.leadership);
+  if (leadership) return { id: leadership.id, type: "team" };
+
+  // Fallback to first team
+  if (teams.length > 0) return { id: teams[0].id, type: "team" };
+
+  throw new Error("No teams found in Strety organization");
+}
+
 async function createTodo(args: {
   title: string;
   description?: string;
   due_date?: string;
   priority?: string;
   assignee?: string;
+  team?: string;
 }): Promise<unknown> {
-  const body: Record<string, unknown> = {
-    data: {
-      type: "todos",
-      attributes: {
-        title: args.title,
-        ...(args.description && { description: args.description }),
-        ...(args.due_date && { due_date: args.due_date }),
-        ...(args.priority && { priority: args.priority }),
-      },
-      relationships: {} as Record<string, unknown>,
-    },
-  };
+  // Resolve the team/space
+  const space = await resolveTeamId(args.team);
+
+  const relationships: Record<string, unknown> = {};
 
   // Resolve assignee name to ID
   if (args.assignee) {
     const result = await resolveAssigneeId(args.assignee);
     if ("error" in result) return result;
-    (body.data as Record<string, unknown>).relationships = {
-      assignee: { data: { id: result.id, type: "people" } },
-    };
+    relationships.assignee = { data: { id: result.id, type: "people" } };
   }
+
+  const body: Record<string, unknown> = {
+    data: {
+      type: "todos",
+      attributes: {
+        title: args.title,
+        space_id: space.id,
+        space_type: space.type,
+        ...(args.description && { description: args.description }),
+        ...(args.due_date && { due_date: args.due_date }),
+        ...(args.priority && { priority: args.priority }),
+      },
+      relationships,
+    },
+  };
 
   const response = await stretyRequest("/todos", "POST", body) as { data: StretyTodo };
   return {
@@ -636,6 +721,321 @@ async function deleteTodo(todoId: string): Promise<unknown> {
     success: true,
     deleted: todoId,
   };
+}
+
+// ============================================================================
+// METRICS (Scorecard items)
+// ============================================================================
+
+async function formatMetric(metric: StretyMetric) {
+  const people = await getPeopleMap();
+  const assigneeRel = metric.relationships?.assignee;
+  const assignee = assigneeRel && "data" in assigneeRel && assigneeRel.data?.id
+    ? people.get(assigneeRel.data.id)?.attributes.name
+    : null;
+
+  return {
+    id: metric.id,
+    title: metric.attributes.title,
+    description: metric.attributes.description,
+    target: metric.attributes.target,
+    target_operator: metric.attributes.target_operator,
+    unit: metric.attributes.unit,
+    frequency: metric.attributes.frequency,
+    current_value: metric.attributes.current_value,
+    assignee,
+    created_at: metric.attributes.created_at,
+    updated_at: metric.attributes.updated_at,
+  };
+}
+
+async function listMetrics(args: {
+  assignee?: string;
+  maxResults?: number;
+}): Promise<unknown> {
+  const maxResults = Math.min(args.maxResults || 50, 100);
+  const allMetrics: StretyMetric[] = [];
+  const people = await getPeopleMap();
+
+  let assigneeId: string | undefined;
+  if (args.assignee) {
+    const assigneeLower = args.assignee.toLowerCase();
+    for (const [id, person] of people) {
+      if (person.attributes.name.toLowerCase().includes(assigneeLower)) {
+        assigneeId = id;
+        break;
+      }
+    }
+    if (!assigneeId) {
+      return { error: `No person found matching "${args.assignee}"`, people: Array.from(people.values()).map(p => p.attributes.name) };
+    }
+  }
+
+  let endpoint = "/metrics?page%5Bsize%5D=20";
+  if (assigneeId) {
+    endpoint += `&filter%5Bassignee_id%5D=${assigneeId}`;
+  }
+
+  let page = 1;
+  const maxPages = 50;
+
+  while (allMetrics.length < maxResults && page <= maxPages) {
+    const response = await stretyRequest(`${endpoint}&page%5Bnumber%5D=${page}`) as StretyListResponse<StretyMetric>;
+
+    if (response.data.length === 0) break;
+
+    for (const metric of response.data) {
+      allMetrics.push(metric);
+      if (allMetrics.length >= maxResults) break;
+    }
+
+    if (!response.links.next) break;
+    page++;
+  }
+
+  const formatted = await Promise.all(allMetrics.map(formatMetric));
+
+  return {
+    metrics: formatted,
+    count: formatted.length,
+    assignee_filter: args.assignee || null,
+  };
+}
+
+async function getMetric(metricId: string): Promise<unknown> {
+  const response = await stretyRequest(`/metrics/${metricId}`) as { data: StretyMetric };
+  return await formatMetric(response.data);
+}
+
+async function createMetric(args: {
+  title: string;
+  description?: string;
+  target?: number;
+  target_operator?: string;
+  unit?: string;
+  frequency?: string;
+  assignee?: string;
+  team?: string;
+  extra_attributes?: Record<string, unknown>;
+}): Promise<unknown> {
+  const space = await resolveTeamId(args.team);
+
+  const relationships: Record<string, unknown> = {};
+  if (args.assignee) {
+    const result = await resolveAssigneeId(args.assignee);
+    if ("error" in result) return result;
+    relationships.assignee = { data: { id: result.id, type: "people" } };
+  }
+
+  const attributes: Record<string, unknown> = {
+    title: args.title,
+    space_id: space.id,
+    space_type: space.type,
+    ...(args.description !== undefined && { description: args.description }),
+    ...(args.target !== undefined && { target: args.target }),
+    ...(args.target_operator !== undefined && { target_operator: args.target_operator }),
+    ...(args.unit !== undefined && { unit: args.unit }),
+    ...(args.frequency !== undefined && { frequency: args.frequency }),
+    ...(args.extra_attributes || {}),
+  };
+
+  const body = {
+    data: {
+      type: "metrics",
+      attributes,
+      relationships,
+    },
+  };
+
+  const response = await stretyRequest("/metrics", "POST", body) as { data: StretyMetric };
+  return {
+    success: true,
+    metric: await formatMetric(response.data),
+  };
+}
+
+async function updateMetric(args: {
+  metricId: string;
+  title?: string;
+  description?: string;
+  target?: number;
+  target_operator?: string;
+  unit?: string;
+  frequency?: string;
+  assignee?: string;
+  extra_attributes?: Record<string, unknown>;
+}): Promise<unknown> {
+  const etag = await getETag(`/metrics/${args.metricId}`);
+
+  const attributes: Record<string, unknown> = {
+    ...(args.title !== undefined && { title: args.title }),
+    ...(args.description !== undefined && { description: args.description }),
+    ...(args.target !== undefined && { target: args.target }),
+    ...(args.target_operator !== undefined && { target_operator: args.target_operator }),
+    ...(args.unit !== undefined && { unit: args.unit }),
+    ...(args.frequency !== undefined && { frequency: args.frequency }),
+    ...(args.extra_attributes || {}),
+  };
+
+  const relationships: Record<string, unknown> = {};
+  if (args.assignee) {
+    const result = await resolveAssigneeId(args.assignee);
+    if ("error" in result) return result;
+    relationships.assignee = { data: { id: result.id, type: "people" } };
+  }
+
+  const body = {
+    data: {
+      type: "metrics",
+      id: args.metricId,
+      attributes,
+      ...(Object.keys(relationships).length > 0 && { relationships }),
+    },
+  };
+
+  const response = await stretyRequest(
+    `/metrics/${args.metricId}`, "PATCH", body, true,
+    { "If-Match": etag }
+  ) as { data: StretyMetric };
+
+  return {
+    success: true,
+    metric: await formatMetric(response.data),
+  };
+}
+
+async function deleteMetric(metricId: string): Promise<unknown> {
+  await stretyRequest(`/metrics/${metricId}`, "DELETE");
+  return { success: true, deleted: metricId };
+}
+
+// ============================================================================
+// METRIC CHECK-INS (weekly scorecard values)
+// ============================================================================
+
+function formatMetricCheckIn(checkIn: StretyMetricCheckIn) {
+  return {
+    id: checkIn.id,
+    value: checkIn.attributes.value,
+    note: checkIn.attributes.note,
+    date: checkIn.attributes.date,
+    created_at: checkIn.attributes.created_at,
+    updated_at: checkIn.attributes.updated_at,
+  };
+}
+
+async function listMetricCheckIns(args: {
+  metricId: string;
+  maxResults?: number;
+}): Promise<unknown> {
+  const maxResults = Math.min(args.maxResults || 50, 100);
+  const all: StretyMetricCheckIn[] = [];
+
+  let page = 1;
+  const maxPages = 50;
+  const base = `/metrics/${args.metricId}/check_ins?page%5Bsize%5D=20`;
+
+  while (all.length < maxResults && page <= maxPages) {
+    const response = await stretyRequest(`${base}&page%5Bnumber%5D=${page}`) as StretyListResponse<StretyMetricCheckIn>;
+    if (response.data.length === 0) break;
+    for (const item of response.data) {
+      all.push(item);
+      if (all.length >= maxResults) break;
+    }
+    if (!response.links.next) break;
+    page++;
+  }
+
+  const formatted = all.map(formatMetricCheckIn);
+  formatted.sort((a, b) => {
+    if (!a.date && !b.date) return 0;
+    if (!a.date) return 1;
+    if (!b.date) return -1;
+    return b.date.localeCompare(a.date);
+  });
+
+  return {
+    check_ins: formatted,
+    count: formatted.length,
+    metric_id: args.metricId,
+  };
+}
+
+async function createMetricCheckIn(args: {
+  metricId: string;
+  value: number;
+  date?: string;
+  note?: string;
+  extra_attributes?: Record<string, unknown>;
+}): Promise<unknown> {
+  const attributes: Record<string, unknown> = {
+    value: args.value,
+    ...(args.date !== undefined && { date: args.date }),
+    ...(args.note !== undefined && { note: args.note }),
+    ...(args.extra_attributes || {}),
+  };
+
+  const body = {
+    data: {
+      type: "metric_check_ins",
+      attributes,
+    },
+  };
+
+  const response = await stretyRequest(
+    `/metrics/${args.metricId}/check_ins`, "POST", body
+  ) as { data: StretyMetricCheckIn };
+
+  return {
+    success: true,
+    metric_id: args.metricId,
+    check_in: formatMetricCheckIn(response.data),
+  };
+}
+
+async function updateMetricCheckIn(args: {
+  metricId: string;
+  checkInId: string;
+  value?: number;
+  date?: string;
+  note?: string;
+  extra_attributes?: Record<string, unknown>;
+}): Promise<unknown> {
+  const endpoint = `/metrics/${args.metricId}/check_ins/${args.checkInId}`;
+  const etag = await getETag(endpoint);
+
+  const attributes: Record<string, unknown> = {
+    ...(args.value !== undefined && { value: args.value }),
+    ...(args.date !== undefined && { date: args.date }),
+    ...(args.note !== undefined && { note: args.note }),
+    ...(args.extra_attributes || {}),
+  };
+
+  const body = {
+    data: {
+      type: "metric_check_ins",
+      id: args.checkInId,
+      attributes,
+    },
+  };
+
+  const response = await stretyRequest(
+    endpoint, "PATCH", body, true,
+    { "If-Match": etag }
+  ) as { data: StretyMetricCheckIn };
+
+  return {
+    success: true,
+    check_in: formatMetricCheckIn(response.data),
+  };
+}
+
+async function deleteMetricCheckIn(args: {
+  metricId: string;
+  checkInId: string;
+}): Promise<unknown> {
+  await stretyRequest(`/metrics/${args.metricId}/check_ins/${args.checkInId}`, "DELETE");
+  return { success: true, deleted: args.checkInId };
 }
 
 // MCP Server setup
@@ -747,6 +1147,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "Assignee name (partial match, e.g., 'Brent' or 'isaac')",
           },
+          team: {
+            type: "string",
+            description: "Team name to assign the todo to (partial match, e.g., 'Leadership'). Defaults to Leadership team if not specified.",
+          },
         },
         required: ["title"],
       },
@@ -818,6 +1222,132 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["todoId"],
       },
     },
+    {
+      name: "strety_list_metrics",
+      description: "List scorecard metrics (KPIs) from Strety. Can filter by assignee name.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          assignee: { type: "string", description: "Filter by assignee name (partial match)" },
+          maxResults: { type: "number", description: "Max results (default 50, max 100)", default: 50 },
+        },
+      },
+    },
+    {
+      name: "strety_get_metric",
+      description: "Get full details of a specific scorecard metric by ID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric" },
+        },
+        required: ["metricId"],
+      },
+    },
+    {
+      name: "strety_create_metric",
+      description: "Create a new scorecard metric (KPI) in Strety. Defaults to Leadership team if no team specified.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Metric title (required)" },
+          description: { type: "string", description: "Description" },
+          target: { type: "number", description: "Target value (e.g., 40 for 40 leads/week)" },
+          target_operator: { type: "string", description: "Comparison operator: '>=', '<=', '=', '>', '<'" },
+          unit: { type: "string", description: "Unit of measurement (e.g., 'leads', 'dollars', '%')" },
+          frequency: { type: "string", description: "Check-in frequency (e.g., 'weekly', 'monthly')" },
+          assignee: { type: "string", description: "Assignee name (partial match)" },
+          team: { type: "string", description: "Team name (partial match). Defaults to Leadership." },
+          extra_attributes: { type: "object", description: "Any additional attributes to pass through to the Strety API" },
+        },
+        required: ["title"],
+      },
+    },
+    {
+      name: "strety_update_metric",
+      description: "Update an existing scorecard metric. Only provide fields to change. Handles ETag automatically.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric to update" },
+          title: { type: "string" },
+          description: { type: "string" },
+          target: { type: "number" },
+          target_operator: { type: "string" },
+          unit: { type: "string" },
+          frequency: { type: "string" },
+          assignee: { type: "string" },
+          extra_attributes: { type: "object" },
+        },
+        required: ["metricId"],
+      },
+    },
+    {
+      name: "strety_delete_metric",
+      description: "Permanently delete a scorecard metric. Cannot be undone.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric to delete" },
+        },
+        required: ["metricId"],
+      },
+    },
+    {
+      name: "strety_list_metric_checkins",
+      description: "List weekly check-ins (scorecard values) for a specific metric. Sorted by date, newest first.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric" },
+          maxResults: { type: "number", description: "Max results (default 50, max 100)", default: 50 },
+        },
+        required: ["metricId"],
+      },
+    },
+    {
+      name: "strety_create_metric_checkin",
+      description: "Create a new check-in (weekly scorecard value) for a metric. This is how you record the weekly number.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric" },
+          value: { type: "number", description: "The numeric value for this check-in (required)" },
+          date: { type: "string", description: "Check-in date in ISO 8601 (e.g., '2026-04-21'). Defaults to current period if omitted." },
+          note: { type: "string", description: "Optional note about this check-in" },
+          extra_attributes: { type: "object", description: "Any additional attributes" },
+        },
+        required: ["metricId", "value"],
+      },
+    },
+    {
+      name: "strety_update_metric_checkin",
+      description: "Update an existing metric check-in. Handles ETag automatically.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric" },
+          checkInId: { type: "string", description: "The ID of the check-in to update" },
+          value: { type: "number" },
+          date: { type: "string" },
+          note: { type: "string" },
+          extra_attributes: { type: "object" },
+        },
+        required: ["metricId", "checkInId"],
+      },
+    },
+    {
+      name: "strety_delete_metric_checkin",
+      description: "Permanently delete a metric check-in. Cannot be undone.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metricId: { type: "string", description: "The ID of the metric" },
+          checkInId: { type: "string", description: "The ID of the check-in to delete" },
+        },
+        required: ["metricId", "checkInId"],
+      },
+    },
   ],
 }));
 
@@ -861,6 +1391,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           due_date: args?.due_date as string | undefined,
           priority: args?.priority as string | undefined,
           assignee: args?.assignee as string | undefined,
+          team: args?.team as string | undefined,
         });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
@@ -887,6 +1418,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "strety_delete_todo": {
         const result = await deleteTodo(args?.todoId as string);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_list_metrics": {
+        const result = await listMetrics({
+          assignee: args?.assignee as string | undefined,
+          maxResults: args?.maxResults as number | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_get_metric": {
+        const result = await getMetric(args?.metricId as string);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_create_metric": {
+        const result = await createMetric({
+          title: args?.title as string,
+          description: args?.description as string | undefined,
+          target: args?.target as number | undefined,
+          target_operator: args?.target_operator as string | undefined,
+          unit: args?.unit as string | undefined,
+          frequency: args?.frequency as string | undefined,
+          assignee: args?.assignee as string | undefined,
+          team: args?.team as string | undefined,
+          extra_attributes: args?.extra_attributes as Record<string, unknown> | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_update_metric": {
+        const result = await updateMetric({
+          metricId: args?.metricId as string,
+          title: args?.title as string | undefined,
+          description: args?.description as string | undefined,
+          target: args?.target as number | undefined,
+          target_operator: args?.target_operator as string | undefined,
+          unit: args?.unit as string | undefined,
+          frequency: args?.frequency as string | undefined,
+          assignee: args?.assignee as string | undefined,
+          extra_attributes: args?.extra_attributes as Record<string, unknown> | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_delete_metric": {
+        const result = await deleteMetric(args?.metricId as string);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_list_metric_checkins": {
+        const result = await listMetricCheckIns({
+          metricId: args?.metricId as string,
+          maxResults: args?.maxResults as number | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_create_metric_checkin": {
+        const result = await createMetricCheckIn({
+          metricId: args?.metricId as string,
+          value: args?.value as number,
+          date: args?.date as string | undefined,
+          note: args?.note as string | undefined,
+          extra_attributes: args?.extra_attributes as Record<string, unknown> | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_update_metric_checkin": {
+        const result = await updateMetricCheckIn({
+          metricId: args?.metricId as string,
+          checkInId: args?.checkInId as string,
+          value: args?.value as number | undefined,
+          date: args?.date as string | undefined,
+          note: args?.note as string | undefined,
+          extra_attributes: args?.extra_attributes as Record<string, unknown> | undefined,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "strety_delete_metric_checkin": {
+        const result = await deleteMetricCheckIn({
+          metricId: args?.metricId as string,
+          checkInId: args?.checkInId as string,
+        });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
 
