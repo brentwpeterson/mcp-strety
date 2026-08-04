@@ -4,3 +4,9 @@ dist/
 *.log
 .DS_Store
 testing/
+
+# Scratch file left by a build or an editor. Zero bytes, dated 2026-01-29, and
+# the only thing keeping this repo showing as dirty. Kept on disk rather than
+# deleted, since a zero-byte file with no history could be a sentinel something
+# checks for.
+.tmp
